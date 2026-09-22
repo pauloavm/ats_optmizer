@@ -1,77 +1,247 @@
 import streamlit as st
 from openai import OpenAI
-from utils import ler_pdf, ler_docx
+import os
+from dotenv import load_dotenv
+import json
+import re
+import PyPDF2
+import docx
+from fpdf import FPDF, XPos, YPos
+import io
 
-# Configuração do cliente OpenAI apontando para o seu 9Router local
-client = OpenAI(
-    base_url="http://192.168.68.107:20128/v1",
-    api_key="sk-dummy" # O 9Router gerencia as chaves reais no painel dele
-)
+# 1. Carrega as variaveis do arquivo .env (Seguranca)
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=api_key)
 
-st.set_page_config(page_title="ATS AI Optimizer", layout="wide")
-st.title("🎯 Otimizador de Currículo ATS (Powered by 9Router)")
+# 2. Configuracao da Pagina Streamlit
+st.set_page_config(page_title="ATS Optimizer Pro", layout="wide")
+
+# 3. Funcoes de Extracao e Pre-processamento (Camada Silver - Zero IA)
+def ler_docx(arquivo):
+    doc = docx.Document(arquivo)
+    return "\n".join([paragrafo.text for paragrafo in doc.paragraphs])
+
+def converter_pdf_para_otimizado(arquivo_pdf):
+    leitor = PyPDF2.PdfReader(arquivo_pdf)
+    texto_completo = ""
+    for pagina in leitor.pages:
+        texto_completo += pagina.extract_text() + "\n"
+
+    linhas = texto_completo.split('\n')
+    cv_estruturado = {"cabecalho": [], "secoes": {}}
+    secao_atual = "cabecalho"
+
+    keywords_secoes = [
+        'EXPERIÊNCIA', 'EXPERIÊNCIAS', 'EDUCAÇÃO', 'FORMAÇÃO', 
+        'RESUMO', 'IDIOMAS', 'COMPETÊNCIAS', 'HABILIDADES', 'CONQUISTAS',
+        'CERTIFICATIONS', 'LANGUAGES'
+    ]
+
+    for linha in linhas:
+        linha_limpa = linha.strip()
+        if not linha_limpa:
+            continue
+
+        linha_upper = linha_limpa.upper()
+        is_secao = any(linha_upper == kw or linha_upper.startswith(kw) for kw in keywords_secoes)
+
+        if is_secao and len(linha_limpa) < 35:
+            secao_atual = linha_upper
+            cv_estruturado["secoes"][secao_atual] = []
+        else:
+            if secao_atual == "cabecalho":
+                cv_estruturado["cabecalho"].append(linha_limpa)
+            else:
+                if secao_atual not in cv_estruturado["secoes"]:
+                    cv_estruturado["secoes"][secao_atual] = []
+                cv_estruturado["secoes"][secao_atual].append(linha_limpa)
+
+    md_linhas = []
+    if cv_estruturado["cabecalho"]:
+        md_linhas.append("### INFORMAÇÕES PESSOAIS")
+        md_linhas.extend(cv_estruturado["cabecalho"])
+        md_linhas.append("")
+
+    for secao, conteudo in cv_estruturado["secoes"].items():
+        md_linhas.append(f"### {secao}")
+        for item in conteudo:
+            if item.startswith('•') or item.startswith('-') or item.startswith('▪'):
+                md_linhas.append(f"- {item[1:].strip()}")
+            else:
+                item_limpo = re.sub(r'\s+', ' ', item)
+                md_linhas.append(item_limpo)
+        md_linhas.append("")
+
+    return "\n".join(md_linhas)
+
+def limpar_texto_para_tokens(texto):
+    texto_limpo = re.sub(r'\s+', ' ', texto)
+    return texto_limpo.strip()
+
+# Funcoes de Exportacao (PDF e DOCX)
+def gerar_pdf(texto_md):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=11)
+
+    for linha in texto_md.split('\n'):
+        # Limpeza basica do markdown para o PDF
+        linha_limpa = linha.replace('### ', '').replace('**', '').strip()
+        # Tratamento de encoding para evitar erros com acentos no FPDF padrao
+        linha_limpa = linha_limpa.encode('latin-1', 'replace').decode('latin-1')
+
+        if linha_limpa:
+            # Sintaxe atualizada do fpdf2 usando XPos e YPos
+            pdf.cell(0, 6, txt=linha_limpa, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        else:
+            pdf.cell(0, 4, txt="", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    # No fpdf2, output() sem argumentos retorna um bytearray, perfeito para o Streamlit
+    return pdf.output()
+
+def gerar_docx(texto_md):
+    doc = docx.Document()
+    for linha in texto_md.split('\n'):
+        linha_limpa = linha.replace('### ', '').replace('**', '').strip()
+        if linha_limpa:
+            doc.add_paragraph(linha_limpa)
+
+    bio = io.BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
+
+# 4. Interface do Usuario (Camada Gold)
+st.title("🎯 ATS Optimizer Pro: Análise e Conversão")
+st.markdown("Diagnóstico profundo de aderência e otimização focada nos algoritmos da Gupy, inHire, LinkedIn e outros.")
 
 col1, col2 = st.columns(2)
-
 with col1:
-    st.subheader("1. Descrição da Vaga")
-    vaga_texto = st.text_area("Cole os requisitos da vaga aqui:", height=300)
-
+    vaga_texto = st.text_area("Cole a descrição da vaga aqui", height=250)
 with col2:
-    st.subheader("2. Seu Currículo Atual")
-    arquivo_cv = st.file_uploader("Envie seu CV (PDF ou DOCX)", type=["pdf", "docx"])
+    arquivo_cv = st.file_uploader("Envie seu CV do LinkedIn (Profile.pdf)", type=["pdf", "docx"])
 
-if st.button("Analisar e Otimizar CV"):
-    if vaga_texto and arquivo_cv:
-        with st.spinner("Processando via 9Router..."):
-            # Extração do texto
+# 5. Motor de IA e Processamento
+if st.button("Analisar Aderência e Gerar CV"):
+    if not api_key:
+        st.error("Erro: Chave da OpenAI não encontrada no arquivo .env.")
+    elif vaga_texto and arquivo_cv:
+        with st.spinner("Analisando algoritmos de ATS e processando com gpt-4o-mini..."):
+
             if arquivo_cv.name.endswith('.pdf'):
-                cv_texto = ler_pdf(arquivo_cv)
+                cv_texto_bruto = converter_pdf_para_otimizado(arquivo_cv)
             else:
-                cv_texto = ler_docx(arquivo_cv)
+                cv_texto_bruto = ler_docx(arquivo_cv)
 
-            # Engenharia de Prompt
+            vaga_otimizada = limpar_texto_para_tokens(vaga_texto)
+            cv_otimizado = limpar_texto_para_tokens(cv_texto_bruto)
+
             prompt_sistema = """
-            Você é um especialista em ATS e recrutamento tech.
-            Sua missão é comparar o CV do candidato com a vaga e reescrever o CV para aumentar o match.
-            REGRA ABSOLUTA: NÃO INVENTE NENHUMA EXPERIÊNCIA, FERRAMENTA OU FORMAÇÃO QUE NÃO ESTEJA NO CV ORIGINAL.
-            Apenas destaque, reorganize e utilize sinônimos adequados para dar match com a vaga.
+            Você é um especialista em ATS e recrutamento tech no Brasil. 
+            Sua missão é analisar o CV do candidato em relação à vaga e gerar um JSON estruturado com a análise, dicas por plataforma e o CV otimizado.
+            NÃO INVENTE DADOS.
 
-            Retorne EXATAMENTE neste formato:
-            SCORE ORIGINAL: [0-100]%
-            SCORE ADAPTADO: [0-100]%
-            JUSTIFICATIVA: [Breve explicação das mudanças]
-            ---CV_INICIO---
-            [Texto completo do novo CV em Markdown]
-            ---CV_FIM---
+            Retorne EXATAMENTE no formato JSON abaixo:
+            {
+              "analise": {
+                "score_estimado": "X%",
+                "pontos_conexao": ["Força 1 encontrada no CV que bate com a vaga", "Força 2"],
+                "pontos_melhoria": ["Gap 1 que o candidato precisa desenvolver ou destacar melhor", "Gap 2"]
+              },
+              "dicas_plataformas": {
+                "Gupy": "Dica específica de como preencher os campos na Gupy baseada nesta vaga.",
+                "inHire": "Dica específica para a inHire.",
+                "Catho": "Dica específica para a Catho.",
+                "Indeed": "Dica específica para o Indeed.",
+                "Infojobs": "Dica específica para o Infojobs.",
+                "LinkedIn": "Dica de SEO e palavras-chave para o perfil do LinkedIn."
+              },
+              "cv_adaptado_markdown": "Texto do CV otimizado em Markdown, seguindo a estrutura: NOME, Título, Contatos, SUMÁRIO, SISTEMAS, SKILLS, COMPETÊNCIAS, REALIZAÇÕES, EDUCAÇÃO, EXPERIÊNCIAS PROFISSIONAIS."
+            }
             """
 
             try:
-                # Chamada para o 9Router
                 resposta = client.chat.completions.create(
-                    model="auto", # O 9Router vai decidir o melhor modelo baseado na sua config
+                    model="gpt-4o-mini",
+                    response_format={ "type": "json_object" },
                     messages=[
                         {"role": "system", "content": prompt_sistema},
-                        {"role": "user", "content": f"VAGA:\n{vaga_texto}\n\nCV ORIGINAL:\n{cv_texto}"}
+                        {"role": "user", "content": f"VAGA: {vaga_otimizada}\n\nCV: {cv_otimizado}"}
                     ],
-                    temperature=0.2
+                    temperature=0.1
                 )
 
-                resultado = resposta.choices[0].message.content
-                st.success("Otimização concluída!")
-                st.markdown(resultado.split("---CV_INICIO---")[0]) # Mostra os scores
+                resultado_json = json.loads(resposta.choices[0].message.content)
 
-                cv_otimizado = resultado.split("---CV_INICIO---")[1].split("---CV_FIM---")[0]
+                # Exibicao da Analise
+                st.header(f"📊 Score de Aderência: {resultado_json['analise']['score_estimado']}")
 
-                # Fase 4: Exportação (Botão de Download em Markdown)
-                st.download_button(
-                    label="💾 Baixar CV Otimizado (Markdown)",
-                    data=cv_otimizado,
-                    file_name="cv_otimizado.md",
-                    mime="text/markdown"
-                )
+                col_analise1, col_analise2 = st.columns(2)
+                with col_analise1:
+                    st.subheader("✅ Pontos de Conexão (Suas Forças)")
+                    for ponto in resultado_json['analise']['pontos_conexao']:
+                        st.write(f"- {ponto}")
+
+                with col_analise2:
+                    st.subheader("⚠️ Pontos de Melhoria (Gaps)")
+                    for gap in resultado_json['analise']['pontos_melhoria']:
+                        st.write(f"- {gap}")
+
+                st.divider()
+
+                # Exibicao das Dicas por ATS
+                st.header("🤖 Estratégia de Preenchimento por ATS")
+                st.markdown("Como adaptar seu perfil para os diferentes algoritmos do mercado:")
+
+                dicas = resultado_json['dicas_plataformas']
+                t1, t2, t3, t4, t5, t6 = st.tabs(["Gupy", "inHire", "LinkedIn", "Indeed", "Catho", "Infojobs"])
+                with t1: st.info(dicas.get('Gupy', 'Sem dicas específicas.'))
+                with t2: st.info(dicas.get('inHire', 'Sem dicas específicas.'))
+                with t3: st.info(dicas.get('LinkedIn', 'Sem dicas específicas.'))
+                with t4: st.info(dicas.get('Indeed', 'Sem dicas específicas.'))
+                with t5: st.info(dicas.get('Catho', 'Sem dicas específicas.'))
+                with t6: st.info(dicas.get('Infojobs', 'Sem dicas específicas.'))
+
+                st.divider()
+
+                # Area de Download
+                st.header("💾 Baixar Currículo Otimizado")
+                st.markdown("Seu currículo foi reescrito (sem inventar dados) para maximizar a leitura linear dos robôs.")
+
+                cv_md = resultado_json['cv_adaptado_markdown']
+
+                col_btn1, col_btn2, col_btn3 = st.columns(3)
+
+                with col_btn1:
+                    st.download_button(
+                        label="Baixar em Markdown (.md)",
+                        data=cv_md,
+                        file_name="cv_otimizado.md",
+                        mime="text/markdown"
+                    )
+
+                with col_btn2:
+                    pdf_bytes = gerar_pdf(cv_md)
+                    st.download_button(
+                        label="Baixar em PDF (.pdf)",
+                        data=pdf_bytes,
+                        file_name="cv_otimizado.pdf",
+                        mime="application/pdf"
+                    )
+
+                with col_btn3:
+                    docx_bytes = gerar_docx(cv_md)
+                    st.download_button(
+                        label="Baixar em Word (.docx)",
+                        data=docx_bytes,
+                        file_name="cv_otimizado.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
+
+                with st.expander("Visualizar CV Otimizado"):
+                    st.markdown(cv_md)
 
             except Exception as e:
-                st.error(f"Erro na comunicação com o 9Router: {e}")
+                st.error(f"Erro na API ou no processamento: {e}")
     else:
         st.warning("Preencha a vaga e envie o currículo.")
